@@ -3840,12 +3840,11 @@ def test_split_quantize_fp8_current_scaling_matches_per_split(
     split_sizes, columnwise, internal, dtype
 ):
     """Grouped split quantization must match quantizing every split on its own."""
-    from transformer_engine.pytorch.utils import is_non_tn_fp8_gemm_supported
-
     torch.manual_seed(0)
     hidden = 128
     x = torch.randn(sum(split_sizes), hidden, dtype=dtype, device="cuda")
     x[: max(split_sizes[0], 1)] *= 1e3  # give splits different scales
+    x.view(-1)[:1] = -0.0
 
     def quantizers():
         out = []
@@ -3860,17 +3859,21 @@ def test_split_quantize_fp8_current_scaling_matches_per_split(
 
     grouped = tex.split_quantize(x, split_sizes, quantizers())
     reference = tex.split_quantize(x, split_sizes, quantizers(), disable_bulk_allocation=True)
-    # The grouped kernel writes +0 where the per-split cast keeps a negative zero
-    # on GPUs with non-TN FP8 GEMMs, so compare bytes only where FP8 GEMMs are TN-only.
-    compare_bytes = not is_non_tn_fp8_gemm_supported()
+    # Grouped outputs view one shared scale-inverse buffer.
+    assert len({out._scale_inv.untyped_storage().data_ptr() for out in grouped}) == 1
+
+    def fp8_bytes(tensor):
+        # The SM100+ grouped cast rounds an input of -0.0 to +0 (0x00), the
+        # per-split cast to -0 (0x80).
+        return torch.where(tensor == 0x80, 0, tensor)
+
     for size, out, ref in zip(split_sizes, grouped, reference):
         for name in ("_data", "_transpose"):
             got, expected = getattr(out, name), getattr(ref, name)
             assert (got is None) == (expected is None), name
             if got is not None:
                 assert got.shape == expected.shape, name
-                if compare_bytes:
-                    assert torch.equal(got, expected), name
+                assert torch.equal(fp8_bytes(got), fp8_bytes(expected)), name
         if size > 0:
             assert torch.equal(out._scale_inv, ref._scale_inv)
             torch.testing.assert_close(out.dequantize(), ref.dequantize(), rtol=0, atol=0)

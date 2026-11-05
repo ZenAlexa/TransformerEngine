@@ -2106,7 +2106,9 @@ void split_quantize_nvfp4_impl(const TensorWrapper &input,
 // dimension keeps each split's slice of the grouped buffers 16-byte aligned for
 // FP8 GEMMs, and every quantizer has the same configuration. Unequal splits pass
 // their sizes to the device with a host copy, which a CUDA graph would replay
-// from a stale host buffer, so a capture only takes equal splits.
+// from a stale host buffer, so a capture only takes equal splits. Amax reduction
+// stays per split: the choice depends on rank-local split sizes and alignment,
+// and ranks taking different paths would issue mismatched collectives.
 bool can_split_quantize_fp8_current_scaling(
     const at::Tensor &input, const std::vector<size_t> &split_sections,
     const std::vector<py::handle> &quantizer_list,
@@ -2141,9 +2143,7 @@ bool can_split_quantize_fp8_current_scaling(
         return q.dtype == first.dtype && q.rowwise_usage == first.rowwise_usage &&
                q.columnwise_usage == first.columnwise_usage && q.internal == first.internal &&
                q.force_pow_2_scales == first.force_pow_2_scales &&
-               q.amax_epsilon == first.amax_epsilon &&
-               q.with_amax_reduction == first.with_amax_reduction &&
-               q.amax_reduction_group == first.amax_reduction_group;
+               q.amax_epsilon == first.amax_epsilon && !q.with_amax_reduction;
       });
 }
 
