@@ -3827,3 +3827,50 @@ def test_swizzle_scales_and_pack_ptrs_for_discrete_weights(
         swizzled_scales_buffer,
         expected_swizzled_scales_buffer,
     )
+
+
+@pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+@pytest.mark.parametrize(
+    "split_sizes", [[64, 64, 64, 64], [0, 48, 1, 207, 0, 16], [0, 0], [33]], ids=str
+)
+@pytest.mark.parametrize("columnwise", [True, False])
+@pytest.mark.parametrize("internal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=str)
+def test_split_quantize_fp8_current_scaling_matches_per_split(
+    split_sizes, columnwise, internal, dtype
+):
+    """Grouped split quantization must match quantizing every split on its own."""
+    from transformer_engine.pytorch.utils import is_non_tn_fp8_gemm_supported
+
+    torch.manual_seed(0)
+    hidden = 128
+    x = torch.randn(sum(split_sizes), hidden, dtype=dtype, device="cuda")
+    x[: max(split_sizes[0], 1)] *= 1e3  # give splits different scales
+
+    def quantizers():
+        out = []
+        for _ in split_sizes:
+            quantizer = Float8CurrentScalingQuantizer(
+                fp8_dtype=tex.DType.kFloat8E4M3, device="cuda"
+            )
+            quantizer.set_usage(rowwise=True, columnwise=columnwise)
+            quantizer.internal = internal
+            out.append(quantizer)
+        return out
+
+    grouped = tex.split_quantize(x, split_sizes, quantizers())
+    reference = tex.split_quantize(x, split_sizes, quantizers(), disable_bulk_allocation=True)
+    # The grouped kernel writes +0 where the per-split cast keeps a negative zero
+    # on GPUs with non-TN FP8 GEMMs, so compare bytes only where FP8 GEMMs are TN-only.
+    compare_bytes = not is_non_tn_fp8_gemm_supported()
+    for size, out, ref in zip(split_sizes, grouped, reference):
+        for name in ("_data", "_transpose"):
+            got, expected = getattr(out, name), getattr(ref, name)
+            assert (got is None) == (expected is None), name
+            if got is not None:
+                assert got.shape == expected.shape, name
+                if compare_bytes:
+                    assert torch.equal(got, expected), name
+        if size > 0:
+            assert torch.equal(out._scale_inv, ref._scale_inv)
+            torch.testing.assert_close(out.dequantize(), ref.dequantize(), rtol=0, atol=0)
